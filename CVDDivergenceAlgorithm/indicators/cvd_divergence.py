@@ -79,7 +79,7 @@ class CVDDivergenceIndicator:
 
         # Check if we have enough data
         if len(self.bars) < max(self.cvd_period, self.fractal_periods * 2 + 1, self.ema_period):
-            return {'signal': None, 'strength': None, 'cvd': cvd_value}
+            return {'signal': None, 'strength': None, 'cvd': cvd_value, 'fractal_price': None}
 
         self.is_ready = True
 
@@ -92,7 +92,8 @@ class CVDDivergenceIndicator:
         return {
             'signal': signal['type'],
             'strength': signal['strength'],
-            'cvd': cvd_value
+            'cvd': cvd_value,
+            'fractal_price': signal['fractal_price']
         }
 
     def _calculate_periodic_cvd(self, current_delta):
@@ -136,41 +137,39 @@ class CVDDivergenceIndicator:
         if ema is None:
             return
 
-        # Check for pivot high (bearish fractal) - requires uptrend
+        # Check for pivot high (bearish fractal)
         is_pivot_high = True
-        if center_bar['close'] > ema:  # Uptrend
-            for i in range(1, n + 1):
-                if bars_list[check_index - i]['high'] >= center_bar['high'] or \
-                   bars_list[check_index + i]['high'] >= center_bar['high']:
-                    is_pivot_high = False
-                    break
+        for i in range(1, n + 1):
+            if bars_list[check_index - i]['high'] >= center_bar['high'] or \
+               bars_list[check_index + i]['high'] >= center_bar['high']:
+                is_pivot_high = False
+                break
 
-            if is_pivot_high:
-                # Get CVD value at this fractal
-                cvd_at_fractal = self._get_cvd_at_index(center_bar['index'])
-                if cvd_at_fractal is not None and cvd_at_fractal > 0:
-                    self.bearish_fractals.append((center_bar['index'], center_bar['high'], cvd_at_fractal))
-                    # Keep only recent fractals
-                    if len(self.bearish_fractals) > 10:
-                        self.bearish_fractals.pop(0)
+        if is_pivot_high:
+            # Get CVD value at this fractal
+            cvd_at_fractal = self._get_cvd_at_index(center_bar['index'])
+            if cvd_at_fractal is not None and cvd_at_fractal > 0:
+                self.bearish_fractals.append((center_bar['index'], center_bar['high'], cvd_at_fractal))
+                # Keep only recent fractals
+                if len(self.bearish_fractals) > 10:
+                    self.bearish_fractals.pop(0)
 
-        # Check for pivot low (bullish fractal) - requires downtrend
+        # Check for pivot low (bullish fractal)
         is_pivot_low = True
-        if center_bar['close'] < ema:  # Downtrend
-            for i in range(1, n + 1):
-                if bars_list[check_index - i]['low'] <= center_bar['low'] or \
-                   bars_list[check_index + i]['low'] <= center_bar['low']:
-                    is_pivot_low = False
-                    break
+        for i in range(1, n + 1):
+            if bars_list[check_index - i]['low'] <= center_bar['low'] or \
+               bars_list[check_index + i]['low'] <= center_bar['low']:
+                is_pivot_low = False
+                break
 
-            if is_pivot_low:
-                # Get CVD value at this fractal
-                cvd_at_fractal = self._get_cvd_at_index(center_bar['index'])
-                if cvd_at_fractal is not None and cvd_at_fractal < 0:
-                    self.bullish_fractals.append((center_bar['index'], center_bar['low'], cvd_at_fractal))
-                    # Keep only recent fractals
-                    if len(self.bullish_fractals) > 10:
-                        self.bullish_fractals.pop(0)
+        if is_pivot_low:
+            # Get CVD value at this fractal
+            cvd_at_fractal = self._get_cvd_at_index(center_bar['index'])
+            if cvd_at_fractal is not None and cvd_at_fractal < 0:
+                self.bullish_fractals.append((center_bar['index'], center_bar['low'], cvd_at_fractal))
+                # Keep only recent fractals
+                if len(self.bullish_fractals) > 10:
+                    self.bullish_fractals.pop(0)
 
     def _get_cvd_at_index(self, bar_index):
         """Get CVD value at a specific bar index."""
@@ -210,7 +209,7 @@ class CVDDivergenceIndicator:
                         self.consecutive_bear_divergences = 0  # Reset bear count
 
                         strength = self._get_divergence_strength(self.consecutive_bull_divergences)
-                        return {'type': 'bullish', 'strength': strength}
+                        return {'type': 'bullish', 'strength': strength, 'fractal_price': last_price}
 
         # Check for bearish divergence (price higher high, CVD lower high)
         if len(self.bearish_fractals) >= 2:
@@ -234,7 +233,7 @@ class CVDDivergenceIndicator:
                         self.consecutive_bull_divergences = 0  # Reset bull count
 
                         strength = self._get_divergence_strength(self.consecutive_bear_divergences)
-                        return {'type': 'bearish', 'strength': strength}
+                        return {'type': 'bearish', 'strength': strength, 'fractal_price': last_price}
 
         # Reset consecutive counts if no divergence for a while
         if current_bar - self.last_bull_divergence_bar > self.max_bars_between_fractals:
@@ -242,7 +241,7 @@ class CVDDivergenceIndicator:
         if current_bar - self.last_bear_divergence_bar > self.max_bars_between_fractals:
             self.consecutive_bear_divergences = 0
 
-        return {'type': None, 'strength': None}
+        return {'type': None, 'strength': None, 'fractal_price': None}
 
     def _get_divergence_strength(self, consecutive_count):
         """Determine divergence strength based on consecutive occurrences."""

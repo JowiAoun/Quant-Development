@@ -22,7 +22,7 @@ class CVDDivergenceAlgorithm(QCAlgorithm):
     def initialize(self):
         """Initialize algorithm parameters, data, and indicators."""
         # Set date range and initial cash
-        self.set_start_date(2024, 1, 1)
+        self.set_start_date(2023, 1, 1)
         self.set_end_date(2024, 12, 31)
         self.set_cash(100000)
 
@@ -55,6 +55,7 @@ class CVDDivergenceAlgorithm(QCAlgorithm):
         # Initialize indicators (will be created when symbol is available)
         self._cvd_indicator = None
         self._atr = None
+        self._volume_sma = None
 
         # Position tracking
         self.position = {
@@ -64,7 +65,17 @@ class CVDDivergenceAlgorithm(QCAlgorithm):
             'stop_loss': 0,
             'take_profit': 0,
             'trailing_stop_triggered': False,
-            'entry_bar': None
+            'entry_bar': None,
+            'stop_distance': 0  # Track distance for trailing stop
+        }
+
+        # Pending signal tracking for breakout confirmation
+        self.pending_signal = {
+            'active': False,
+            'type': None,  # 'bullish' or 'bearish'
+            'fractal_price': 0,
+            'detected_bar': self.start_date,  # Initialize to algorithm start instead of None
+            'strength': None
         }
 
         # NY session tracking (CME E-mini futures trade nearly 24/5)
@@ -94,40 +105,36 @@ class CVDDivergenceAlgorithm(QCAlgorithm):
                 # Initialize ATR indicator
                 self._atr = self.atr(self._symbol, self.atr_period)
 
+                # Initialize volume SMA for volume confirmation
+                self._volume_sma = self.sma(self._symbol, 20, Resolution.MINUTE, Field.VOLUME)
+
                 self.debug(f"Trading contract: {self._symbol}")
 
     def on_data(self, data: Slice):
         """Main trading logic executed on each data slice."""
-        # Skip if warming up or no symbol set
         if self.is_warming_up or self._symbol is None:
             return
 
-        # Check if we have data for our symbol
         if not data.bars.contains_key(self._symbol):
             return
 
         bar = data.bars[self._symbol]
 
-        # Check if we're in NY trading session
         if not self._is_ny_trading_session(self.time):
             return
 
-        # Update CVD indicator
         signal_data = self._cvd_indicator.update(bar)
 
-        # Check if indicator is ready
         if not self._cvd_indicator.is_ready or not self._atr.is_ready:
             return
 
         current_price = bar.close
-        atr_value = self._atr.current.value
+        bar_volume = bar.volume
 
-        # Manage existing positions
         if self.position['is_long'] or self.position['is_short']:
-            self._manage_position(current_price, atr_value, signal_data)
+            self._manage_position(current_price, signal_data)
         else:
-            # Look for entry signals
-            self._check_entry_signals(current_price, atr_value, signal_data)
+            self._check_entry_signals(current_price, bar_volume, signal_data)
 
     def _is_ny_trading_session(self, current_time):
         """
@@ -150,65 +157,135 @@ class CVDDivergenceAlgorithm(QCAlgorithm):
 
         return session_start <= time_of_day <= session_end
 
-    def _check_entry_signals(self, current_price, atr_value, signal_data):
+    def _check_entry_signals(self, current_price, bar_volume, signal_data):
         """
-        Check for entry signals and place orders.
+        Check for entry signals with breakout and volume confirmation.
 
         Args:
             current_price: Current market price
-            atr_value: Current ATR value
-            signal_data: Dictionary with 'signal', 'strength', 'cvd'
+            bar_volume: Current bar volume
+            signal_data: Dictionary with 'signal', 'strength', 'cvd', 'fractal_price'
         """
         signal_type = signal_data['signal']
         signal_strength = signal_data['strength']
+        fractal_price = signal_data.get('fractal_price')
 
-        if signal_type is None:
+        # Skip if fractal_price is None (indicator not ready or user's indicator doesn't provide it)
+        if fractal_price is None and signal_type is not None:
+            self.debug("Divergence detected but fractal_price is None, skipping")
             return
 
-        # Calculate position size based on risk
-        stop_distance = atr_value * self.stop_loss_atr_multiplier
+        if signal_type is not None and not self.pending_signal['active']:
+            # New divergence detected - set as pending
+            self.pending_signal['active'] = True
+            self.pending_signal['type'] = signal_type
+            self.pending_signal['fractal_price'] = fractal_price
+            self.pending_signal['detected_bar'] = self.time
+            self.pending_signal['strength'] = signal_strength
+
+            self.debug(f"PENDING {signal_type.upper()} DIVERGENCE | Fractal: {fractal_price:.2f} | "
+                      f"Strength: {signal_strength} | Waiting for breakout confirmation")
+            return
+
+        if self.pending_signal['active']:
+            bars_since_signal = (self.time - self.pending_signal['detected_bar']).total_seconds() / 60
+
+            # Expire pending signal after 10 bars (10 minutes on minute resolution)
+            if bars_since_signal > 10:
+                self.debug(f"EXPIRED {self.pending_signal['type'].upper()} signal - no breakout after 10 bars")
+                self._reset_pending_signal()
+                return
+
+            # Check for breakout confirmation
+            breakout_buffer = 0.5  # MES points buffer for breakout
+            breakout_confirmed = False
+
+            if self.pending_signal['type'] == 'bullish':
+                # For bullish: price must break above fractal low
+                breakout_confirmed = current_price > (self.pending_signal['fractal_price'] + breakout_buffer)
+            elif self.pending_signal['type'] == 'bearish':
+                # For bearish: price must break below fractal high
+                breakout_confirmed = current_price < (self.pending_signal['fractal_price'] - breakout_buffer)
+
+            # Check volume confirmation
+            volume_confirmed = bar_volume > (self._volume_sma.current.value * 1.2) if self._volume_sma.is_ready else True
+
+            # Enter trade if both confirmations met
+            if breakout_confirmed and volume_confirmed:
+                self._enter_trade_with_pivot_stops(current_price)
+            elif breakout_confirmed and not volume_confirmed:
+                self.debug(f"Breakout confirmed but volume too low: {bar_volume:.0f} vs {self._volume_sma.current.value * 1.2:.0f}")
+
+    def _enter_trade_with_pivot_stops(self, entry_price):
+        """
+        Enter trade using pivot-based stops and 1:2 RR.
+
+        Args:
+            entry_price: Current market price for entry
+        """
+        signal_type = self.pending_signal['type']
+        fractal_price = self.pending_signal['fractal_price']
+        signal_strength = self.pending_signal['strength']
+
+        # Calculate pivot-based stop loss and 1:2 RR target
+        if signal_type == 'bullish':
+            stop_loss = fractal_price  # Stop just at/below the fractal low
+            stop_distance = entry_price - stop_loss
+            take_profit = entry_price + (stop_distance * 2)  # 1:2 RR
+        else:  # bearish
+            stop_loss = fractal_price  # Stop just at/above the fractal high
+            stop_distance = stop_loss - entry_price
+            take_profit = entry_price - (stop_distance * 2)  # 1:2 RR
+
+        # Calculate position size based on stop distance
         quantity = self._calculate_position_size(stop_distance)
 
         if quantity == 0:
             self.debug(f"Calculated quantity is 0, skipping trade")
+            self._reset_pending_signal()
             return
 
-        # Enter long on bullish divergence
+        # Place order
         if signal_type == 'bullish':
             self.market_order(self._symbol, quantity)
             self.position['is_long'] = True
-            self.position['entry_price'] = current_price
-            self.position['stop_loss'] = current_price - stop_distance
-            self.position['take_profit'] = current_price + (atr_value * self.take_profit_atr_multiplier)
-            self.position['trailing_stop_triggered'] = False
-            self.position['entry_bar'] = self.time
-
-            self.debug(f"LONG ENTRY | Price: {current_price:.2f} | Strength: {signal_strength} | "
-                      f"Qty: {quantity} | Stop: {self.position['stop_loss']:.2f} | "
-                      f"Target: {self.position['take_profit']:.2f}")
-
-        # Enter short on bearish divergence
-        elif signal_type == 'bearish':
+        else:
             self.market_order(self._symbol, -quantity)
             self.position['is_short'] = True
-            self.position['entry_price'] = current_price
-            self.position['stop_loss'] = current_price + stop_distance
-            self.position['take_profit'] = current_price - (atr_value * self.take_profit_atr_multiplier)
-            self.position['trailing_stop_triggered'] = False
-            self.position['entry_bar'] = self.time
 
-            self.debug(f"SHORT ENTRY | Price: {current_price:.2f} | Strength: {signal_strength} | "
-                      f"Qty: {quantity} | Stop: {self.position['stop_loss']:.2f} | "
-                      f"Target: {self.position['take_profit']:.2f}")
+        # Update position tracking
+        self.position['entry_price'] = entry_price
+        self.position['stop_loss'] = stop_loss
+        self.position['take_profit'] = take_profit
+        self.position['stop_distance'] = stop_distance
+        self.position['trailing_stop_triggered'] = False
+        self.position['entry_bar'] = self.time
 
-    def _manage_position(self, current_price, atr_value, signal_data):
+        self.debug(f"{signal_type.upper()} ENTRY CONFIRMED | Price: {entry_price:.2f} | "
+                  f"Strength: {signal_strength} | Qty: {quantity} | "
+                  f"Stop: {stop_loss:.2f} ({stop_distance:.2f} pts) | "
+                  f"Target: {take_profit:.2f} | RR: 1:2")
+
+        # Reset pending signal after entry
+        self._reset_pending_signal()
+
+    def _reset_pending_signal(self):
+        """Reset pending signal tracker."""
+        self.pending_signal = {
+            'active': False,
+            'type': None,
+            'fractal_price': 0,
+            'detected_bar': self.time,  # Reset to current time, not None
+            'strength': None
+        }
+
+    def _manage_position(self, current_price, signal_data):
         """
         Manage existing position: check stops, targets, and trailing stops.
 
         Args:
             current_price: Current market price
-            atr_value: Current ATR value
-            signal_data: Dictionary with 'signal', 'strength', 'cvd'
+            signal_data: Dictionary with 'signal', 'strength', 'cvd', 'fractal_price'
         """
         signal_type = signal_data['signal']
 
@@ -232,10 +309,10 @@ class CVDDivergenceAlgorithm(QCAlgorithm):
                 self._close_position("Stop loss hit")
                 return
 
-            # Trailing stop logic: move stop to breakeven when price moves favorably
+            # Trailing stop logic: move stop to breakeven when halfway to target
             if not self.position['trailing_stop_triggered']:
                 profit_distance = current_price - self.position['entry_price']
-                trailing_threshold = atr_value * self.trailing_stop_atr_multiplier
+                trailing_threshold = self.position['stop_distance'] * 1.0  # At 1x stop distance (halfway to 2x target)
 
                 if profit_distance >= trailing_threshold:
                     self.position['stop_loss'] = self.position['entry_price']
@@ -254,10 +331,10 @@ class CVDDivergenceAlgorithm(QCAlgorithm):
                 self._close_position("Stop loss hit")
                 return
 
-            # Trailing stop logic: move stop to breakeven when price moves favorably
+            # Trailing stop logic: move stop to breakeven when halfway to target
             if not self.position['trailing_stop_triggered']:
                 profit_distance = self.position['entry_price'] - current_price
-                trailing_threshold = atr_value * self.trailing_stop_atr_multiplier
+                trailing_threshold = self.position['stop_distance'] * 1.0  # At 1x stop distance (halfway to 2x target)
 
                 if profit_distance >= trailing_threshold:
                     self.position['stop_loss'] = self.position['entry_price']
@@ -289,7 +366,8 @@ class CVDDivergenceAlgorithm(QCAlgorithm):
             'stop_loss': 0,
             'take_profit': 0,
             'trailing_stop_triggered': False,
-            'entry_bar': None
+            'entry_bar': None,
+            'stop_distance': 0
         }
 
     def _calculate_position_size(self, stop_distance):
