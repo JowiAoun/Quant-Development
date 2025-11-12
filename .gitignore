@@ -1,11 +1,3 @@
-.venv
-venv
-.claude
-CLAUDE.md
-data/
-**/backtests/
-**/.idea/
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -188,6 +180,15 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+.venv
+venv
+.claude
+CLAUDE.md
+data/
+**/backtests/
+**/.idea/
+**/config.json
 
 # PyCharm
 #   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
