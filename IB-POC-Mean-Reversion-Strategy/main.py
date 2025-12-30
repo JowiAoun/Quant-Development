@@ -2,7 +2,7 @@
 from AlgorithmImports import *
 # endregion
 
-class IBSupportBalanceReversal(QCAlgorithm):
+class IBPOCMeanReversionStrategy(QCAlgorithm):
 
     def initialize(self):
         # Locally Lean installs free sample data, to download more data please visit https://www.quantconnect.com/docs/v2/lean-cli/datasets/downloading-data
